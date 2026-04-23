@@ -180,9 +180,10 @@ public:
 					  std::vector<T>& recv,
 					  int root = 0) const {
 		T* recv_ptr = rank_ == root ? recv.data() : nullptr;
+		const int recv_count = int(send.size());
 		mpi_check(
 			MPI_Gather(send.data(), send.size(), mpi_type_v<T>, recv_ptr,
-					   recv.size(), mpi_type_v<T>, root, comm_),
+					   recv_count, mpi_type_v<T>, root, comm_),
 			"MPI_Gather");
 	}
 
@@ -244,34 +245,21 @@ private:
 	double start_ = 0.0;
 };
 
-struct TimingItem {
-	std::string stage;
-	double seconds = 0.0;
-};
-
 class DistributedTimer final {
 public:
 	explicit DistributedTimer(const MPIWorld& world)
 		: world_(world) {
 	}
 
-	template <typename Func>
-	void measure(const std::string& stage, Func&& task) {
+	double measure(auto&& task) {
 		world_.barrier();
 		WallTimer timer;
-		std::forward<Func>(task)();
+		std::forward<decltype(task)>(task)();
 		world_.barrier();
-		const double stage_seconds = world_.reduce_max(timer.elapsed_seconds());
-		if (world_.rank() == 0) {
-			records_.emplace_back(TimingItem{ stage, stage_seconds });
-		}
-	}
-
-	const std::vector<TimingItem>& records() const noexcept {
-		return records_;
+		const double elapsed = world_.reduce_max(timer.elapsed_seconds());
+		return world_.rank() == 0 ? elapsed : 0.0;
 	}
 
 private:
 	const MPIWorld& world_;
-	std::vector<TimingItem> records_;
 };

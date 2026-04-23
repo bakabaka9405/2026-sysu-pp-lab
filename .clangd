@@ -162,8 +162,8 @@ Diagnostics:
       readability-identifier-naming.VariableCase: camelCase
 
 CompileFlags:
-  Add: [-xc++, -Wall, -Wextra, -Wno-unused-variable, -std=c++23, -DMR_CLANGD]
-  Compiler: 'g++.exe'
+  Add: [-xc++, -Wall, -Wextra, -Wno-unused-variable, -std=c++26, -DMR_CLANGD]
+  Compiler: 'C:\\Tools\\mingw64\\bin\\g++.exe'
 
 InlayHints:
   Enabled: true

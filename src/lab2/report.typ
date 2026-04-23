@@ -87,14 +87,19 @@
 - 操作系统：Windows 11 23H2 22631.6199
 - 处理器：13th Gen Intel(R) Core(TM) i5-13600K 12 核 20 线程
 - Microsoft MPI 版本：10.1.12498.18
+- 编译器版本：gcc version 16.0.1 20260222 (experimental) (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r1)
 
 == 实验设计
 
-三个入口共用同一套矩阵读入、切分、乘法和结果回收代码。`task1` 采用均分行块并配合集合通信，`task2` 先把尺寸信息封成结构体，再通过 `mpi_type_create_struct` 对应的包装发送，`task3` 则使用不等分发的行块划分，让不同进程拿到的行数不完全相同。
+为了确保编译器优化不会将矩阵乘法过程省略，所有benchmark均以从文件读取两个矩阵、向文件输出结果矩阵的形式运行，保证每次运行的输入相同，计时仅包含计算过程，不包含输入输出过程。
+
+统一的输入数据已提前通过代码随机生成，这里省略不提。
+
+三个入口共用同一套基于 `std::mdspan` 的矩阵视图、切分、乘法和结果回收代码。`task1` 采用均分行块并配合集合通信，`task2` 先把尺寸信息封成结构体，再通过 `mpi_type_create_struct` 对应的包装发送，`task3` 则改进划分方式，以二维划分组织并行计算。
 
 == 核心代码
 
-共用封装层保留了上次实验中的 `MPIEnvironment` 和 `MPIWorld` 结构，并补充了结构体通信与变长分发的包装。任务二使用的结构体类型，直接通过 `MPI_Type_create_struct` 生成并提交，然后再用统一接口广播出去。
+共用封装层保留了上次实验中的 `MPIEnvironment` 和 `MPIWorld` 结构，并补充了结构体通信、矩阵视图构造以及二维划分所需的通信包装。任务二使用的结构体类型，直接通过 `MPI_Type_create_struct` 生成并提交，然后再用统一接口广播出去。
 
 ```cpp
 template <std::size_t N>
@@ -114,35 +119,63 @@ void scatterv(const std::vector<T>& send,
 			 int root = 0) const;
 ```
 
-矩阵乘法只保留按块计算的一份实现。局部矩阵拿到以后，直接按行、列和共享维度做三重循环，结果写回局部结果数组。
+矩阵乘法只保留基于 `std::mdspan` 的按块实现。局部矩阵拿到以后，先构造视图，再按行、列和共享维度做三重循环，结果写回局部结果数组。
+
+更新后的实现把矩阵存储与计算接口统一为 `std::mdspan` 视图，并用 concept 限定读写能力。这样在任务一和任务二中可以直接复用同一份乘法内核，在任务三中也可以直接借助 `std::submdspan` 取出二维子块。
 
 ```cpp
-inline void multiply_block(int rows, int shared, int cols,
-						   const vector<double>& A,
-						   const vector<double>& B,
-						   vector<double>& C) {
-	C.assign(static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols), 0.0);
-	for (int i = 0; i < rows; ++i) {
-		for (int t = 0; t < shared; ++t) {
-			for (int j = 0; j < cols; ++j) {
-				C[static_cast<std::size_t>(i) * cols + j] +=
-					A[static_cast<std::size_t>(i) * shared + t] *
-					B[static_cast<std::size_t>(t) * cols + j];
+template <class View>
+concept MatrixReadable = requires(const View& view, std::size_t i, std::size_t j) {
+	{ view.extent(0) } -> std::convertible_to<std::size_t>;
+	{ view.extent(1) } -> std::convertible_to<std::size_t>;
+	{ view[i, j] } -> std::convertible_to<double>;
+};
+
+template <class View>
+concept MatrixWritable = MatrixReadable<View> && requires(View view, std::size_t i, std::size_t j, double value) {
+	view[i, j] = value;
+};
+
+void gemm(MatrixReadable auto const& A, MatrixReadable auto const& B, MatrixWritable auto C) {
+	const std::size_t n = A.extent(0);
+	const std::size_t k = A.extent(1);
+	const std::size_t m = B.extent(1);
+
+	if (k != B.extent(0) || n != C.extent(0) || m != C.extent(1)) {
+		throw std::runtime_error("Matrix shapes do not match for multiplication.");
+	}
+
+	for (std::size_t i = 0; i < n; i++)
+		for (std::size_t j = 0; j < m; j++)
+			C[i, j] = 0.0;
+
+	for (std::size_t i = 0; i < n; ++i) {
+		for (std::size_t t = 0; t < k; ++t) {
+			const double tmp = A[i, t];
+			for (std::size_t j = 0; j < m; ++j) {
+				C[i, j] += tmp * B[t, j];
 			}
 		}
 	}
 }
 ```
 
-`task3` 先按进程数算出每个进程拿到多少行，再把行数换成元素数交给 `scatterv` 和 `gatherv`。这样即使某些规模不能整除进程数，也能直接处理。
+`task3` 先用 `MPI_Dims_create` 将进程数分解为 `prow × pcol` 的二维网格，再把 A 按进程行切成若干行块，把 B 按进程列切成若干列块。根进程先把对应子块发送到各自的行根或列根，再通过行内广播和列内广播分发到整个进程网格，这样每个进程只负责一个 `C` 子块的计算。
 
 ```cpp
-const auto row_counts = split_rows(dim, procs);
+const auto row_counts = split_rows(dim, prow);
+const auto col_counts = split_rows(dim, pcol);
 const auto row_displs = prefix_sum(row_counts);
-const auto a_counts = scale_counts(row_counts, dim);
-const auto a_displs = scale_counts(row_displs, dim);
-world.scatterv(A, a_counts, a_displs, local_A);
-world.gatherv(local_C, c_counts, c_displs, C);
+const auto col_displs = prefix_sum(col_counts);
+
+const int row = world.rank() / pcol;
+const int col = world.rank() % pcol;
+
+MPI_Comm_split(MPI_COMM_WORLD, row, col, &row_comm);
+MPI_Comm_split(MPI_COMM_WORLD, col, row, &col_comm);
+
+auto A_block = slice_block(A_view, row_displs[r], row_counts[r], 0, dim);
+auto B_block = slice_block(B_view, 0, dim, col_displs[c], col_counts[c]);
 ```
 
 = 实验结果
@@ -166,11 +199,11 @@ world.gatherv(local_C, c_counts, c_displs, C);
     矩阵规模
   ],
   [128], [256], [512], [1024], [2048],
-  [1], [0.000438], [0.002642], [0.019492], [0.156743], [2.139832],
-  [2], [0.000338], [0.001641], [0.009977], [0.096904], [1.316903],
-  [4], [0.000611], [0.001469], [0.006078], [0.088599], [0.905714],
-  [8], [0.000520], [0.001784], [0.007062], [0.081866], [0.844810],
-  [16], [0.000976], [0.002219], [0.007385], [0.101666], [0.814141],
+  [1], [0.000362], [0.002539], [0.018575], [0.162845], [2.248916],
+  [2], [0.000311], [0.001723], [0.011035], [0.097654], [1.286171],
+  [4], [0.000593], [0.001204], [0.006543], [0.102224], [0.961546],
+  [8], [0.000733], [0.001752], [0.005966], [0.105539], [0.836732],
+  [16], [0.001196], [0.001831], [0.007437], [0.107725], [0.844656],
 )
 
 第二种实现的结果如下。
@@ -192,11 +225,11 @@ world.gatherv(local_C, c_counts, c_displs, C);
     矩阵规模
   ],
   [128], [256], [512], [1024], [2048],
-  [1], [0.000381], [0.002633], [0.019162], [0.158397], [2.124900],
-  [2], [0.000521], [0.001908], [0.015639], [0.090618], [1.253576],
-  [4], [0.000556], [0.001599], [0.006700], [0.088080], [2.111655],
-  [8], [0.000710], [0.001689], [0.005952], [0.080984], [0.799958],
-  [16], [0.001037], [0.001917], [0.006970], [0.103926], [0.806941],
+  [1], [0.000360], [0.002511], [0.018850], [0.161080], [2.180046],
+  [2], [0.000478], [0.001753], [0.010169], [0.103269], [1.306407],
+  [4], [0.000568], [0.001130], [0.006103], [0.095631], [0.955449],
+  [8], [0.000455], [0.001873], [0.007136], [0.103104], [0.969275],
+  [16], [0.000723], [0.001468], [0.007613], [0.112654], [0.902465],
 )
 
 第三种实现的结果如下。
@@ -218,14 +251,14 @@ world.gatherv(local_C, c_counts, c_displs, C);
     矩阵规模
   ],
   [128], [256], [512], [1024], [2048],
-  [1], [0.001609], [0.002470], [0.018704], [0.155879], [2.229869],
-  [2], [0.000454], [0.001425], [0.010104], [0.095341], [3.640236],
-  [4], [0.000729], [0.001819], [0.006985], [0.090474], [2.110239],
-  [8], [0.000924], [0.001548], [0.005834], [0.082977], [0.795026],
-  [16], [0.001696], [0.003165], [0.010533], [0.099046], [0.840918],
+  [1], [0.000439], [0.002736], [0.020197], [0.168723], [2.234676],
+  [2], [0.000334], [0.001594], [0.010922], [0.104662], [1.330520],
+  [4], [0.000499], [0.001638], [0.008288], [0.059984], [1.045352],
+  [8], [0.000825], [0.001077], [0.008299], [0.062985], [0.870710],
+  [16], [0.001792], [0.001727], [0.008498], [0.044372], [0.812574],
 )
 
-三组数据放在一起看，整体趋势比较一致。矩阵越大，并行后节省的时间越明显；矩阵较小时，进程启动和通信的开销占比更高，所以不同做法之间差别不大。第二种实现把控制参数封成结构体后，整体时间和第一种很接近，说明这部分开销不算大。第三种实现换成不等分发后，整体也没有明显变慢，只是在个别点上有一些波动，说明这次测试主要瓶颈还是矩阵计算本身。
+三组数据放在一起看，整体趋势比较一致。矩阵越大，并行后节省的时间越明显；矩阵较小时，进程启动和通信的开销占比更高，所以不同做法之间差别不大。第二种实现把控制参数封成结构体后，整体时间与第一种仍然接近，说明参数封装带来的额外代价很小。第三种实现采用二维划分后，在较大规模下更容易获得稳定收益，尤其是在 1024 和 2048 规模、进程数较高时，结果明显优于前两种实现，这说明二维分块能够更好地平衡行与列方向的通信和计算压力。
 
 = 实验感想
 

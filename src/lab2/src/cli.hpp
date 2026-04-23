@@ -6,7 +6,7 @@
 #include <string_view>
 
 struct CliOptions final {
-	int dim = 2048;
+	int dim = 128;
 	std::filesystem::path input_dir = "data";
 	std::filesystem::path output_dir = "data";
 };

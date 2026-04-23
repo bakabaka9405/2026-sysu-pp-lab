@@ -10,3 +10,4 @@ mirai_config.json
 .vscode/
 data/
 AGENTS.md
+*.pdf

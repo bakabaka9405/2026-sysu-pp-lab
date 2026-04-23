@@ -11,21 +11,22 @@
 using std::vector;
 
 struct TaskHeader {
-	int rows = 0;
-	int shared = 0;
-	int cols = 0;
+	int n = 0;
+	int k = 0;
+	int m = 0;
 	int procs = 0;
 };
 
-MpiDatatype make_task_header_type() {
-	return make_struct_datatype(std::array<int, 4>{ 1, 1, 1, 1 },
-								std::array<MPI_Aint, 4>{
-									static_cast<MPI_Aint>(offsetof(TaskHeader, rows)),
-									static_cast<MPI_Aint>(offsetof(TaskHeader, shared)),
-									static_cast<MPI_Aint>(offsetof(TaskHeader, cols)),
-									static_cast<MPI_Aint>(offsetof(TaskHeader, procs)),
-								},
-								std::array<MPI_Datatype, 4>{ mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int> });
+MpiDatatype make_header() {
+	return make_struct_datatype(
+		{ 1, 1, 1, 1 },
+		std::array<MPI_Aint, 4>{
+			offsetof(TaskHeader, n),
+			offsetof(TaskHeader, k),
+			offsetof(TaskHeader, m),
+			offsetof(TaskHeader, procs),
+		},
+		{ mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int> });
 }
 
 int main(int argc, char** argv) {
@@ -35,40 +36,41 @@ int main(int argc, char** argv) {
 	MPIWorld world;
 
 	TaskHeader header{ options.dim, options.dim, options.dim, world.size() };
-	const auto header_type = make_task_header_type();
+	const auto header_type = make_header();
 	world.bcast_value(header, header_type.get());
 
-	if (header.rows % header.procs != 0) {
+	if (header.n % header.procs != 0) {
 		throw std::runtime_error("Matrix dimension must be divisible by the process count.");
 	}
 
-	const int local_rows = header.rows / header.procs;
-	vector<double> A;
-	vector<double> B;
-	vector<double> C;
-	B.resize(header.shared * header.cols);
-	vector<double> local_A(local_rows * header.shared);
-	vector<double> local_C;
+	const int local_rows = header.n / header.procs;
+	vector<double> A, B, C;
+	B.resize(header.k * header.m);
+	vector<double> local_A(local_rows * header.k);
+	vector<double> local_C(local_rows * header.m);
 
 	if (world.rank() == 0) {
-		load_input(options.input_dir, header.rows, A, B);
-		C.resize(header.rows * header.cols);
+		load_input(options.input_dir, header.n, A, B);
+		C.resize(header.n * header.m);
 	}
 
 	DistributedTimer timer(world);
-	timer.measure("task2", [&] {
+	const double elapsed = timer.measure([&] {
 		world.scatter_equal(A, local_A);
 
 		world.bcast(B);
-		multiply_block(local_rows, header.shared, header.cols, local_A, B, local_C);
+		const auto A_view = make_matrix_view(local_A, local_rows, header.k);
+		const auto B_view = make_matrix_view(B, header.k, header.m);
+		auto C_view = make_matrix_view(local_C, local_rows, header.m);
+		gemm(A_view, B_view, C_view);
 
 		world.gather_equal(local_C, C);
 	});
 
 	if (world.rank() == 0) {
-		std::cout << std::fixed << std::setprecision(6) << timer.records().front().seconds << '\n';
+		std::cout << std::fixed << std::setprecision(6) << elapsed << '\n';
 		std::filesystem::create_directories(options.output_dir);
-		write_matrix(options.output_dir / std::format("C_{}.txt", header.rows), header.rows, header.cols, C);
+		write_matrix(options.output_dir / std::format("C_{}.txt", header.n), header.n, header.m, C);
 	}
 
 	return 0;
