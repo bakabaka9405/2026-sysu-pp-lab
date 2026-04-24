@@ -23,14 +23,18 @@
 
 #v(0.3em)
 
+#let author = sys.inputs.at("author", default: "数据删除")
+#let id = sys.inputs.at("id", default: "数据删除")
+#let email = sys.inputs.at("email", default: "数据删除")
+
 #table(
   columns: (0.6fr, 1.9fr, 1fr, 2fr),
   align: center + horizon,
   stroke: 0.5pt,
   inset: 8pt,
   [实验], [基于MPI的并行矩阵乘法（进阶）], [专业（方向）], [计算机科学与技术（人工智能与大数据）],
-  [学号], [23336223], [姓名], [万耀文],
-  [Email], [#text(size: 10pt, "wanyw3@mail2.sysu.edu.cn")], [完成日期], [2026年4月9日],
+[学号], [#id], [姓名], [#author],
+[Email], [#text(size: 10pt, email)], [完成日期], [2026年4月24日],
 )
 
 #v(1em)
@@ -41,7 +45,7 @@
 
 = 实验目的
 
-改进上次实验中的MPI并行矩阵乘法 (MPI-v1)，并讨论不同通信方式对性能的影响。
+改进 MPI 并行矩阵乘法 (MPI-v1)，并讨论不同通信方式对性能的影响。
 
 *输入*：$m,n,k$ 三个整数，每个整数的取值范围均为 $[128, 2048]$
 
@@ -93,35 +97,13 @@
 
 为了确保编译器优化不会将矩阵乘法过程省略，所有benchmark均以从文件读取两个矩阵、向文件输出结果矩阵的形式运行，保证每次运行的输入相同，计时仅包含计算过程，不包含输入输出过程。
 
-统一的输入数据已提前通过代码随机生成，这里省略不提。
+统一的输入数据已提前通过代码随机生成，并在不同实现之间保持一致。
 
-三个入口共用同一套基于 `std::mdspan` 的矩阵视图、切分、乘法和结果回收代码。`task1` 采用均分行块并配合集合通信，`task2` 先把尺寸信息封成结构体，再通过 `mpi_type_create_struct` 对应的包装发送，`task3` 则改进划分方式，以二维划分组织并行计算。
+三个入口共用同一套矩阵视图构造、数据切分和乘法内核。`task1` 采用均分行块配合集合通信，`task2` 先将尺寸信息封为结构体再通过 `MPI_Type_create_struct` 对应的派生类型广播，`task3` 则采用二维进程网格组织并行计算。
 
 == 核心代码
 
-共用封装层保留了上次实验中的 `MPIEnvironment` 和 `MPIWorld` 结构，并补充了结构体通信、矩阵视图构造以及二维划分所需的通信包装。任务二使用的结构体类型，直接通过 `MPI_Type_create_struct` 生成并提交，然后再用统一接口广播出去。
-
-```cpp
-template <std::size_t N>
-inline MpiDatatype make_struct_datatype(
-	const std::array<int, N>& block_lengths,
-	const std::array<MPI_Aint, N>& displacements,
-	const std::array<MPI_Datatype, N>& types);
-
-template <typename T>
-void bcast_value(T& value, MPI_Datatype type, int root = 0) const;
-
-template <typename T>
-void scatterv(const std::vector<T>& send,
-			 const std::vector<int>& send_counts,
-			 const std::vector<int>& displacements,
-			 std::vector<T>& recv,
-			 int root = 0) const;
-```
-
-矩阵乘法只保留基于 `std::mdspan` 的按块实现。局部矩阵拿到以后，先构造视图，再按行、列和共享维度做三重循环，结果写回局部结果数组。
-
-更新后的实现把矩阵存储与计算接口统一为 `std::mdspan` 视图，并用 concept 限定读写能力。这样在任务一和任务二中可以直接复用同一份乘法内核，在任务三中也可以直接借助 `std::submdspan` 取出二维子块。
+矩阵乘法内核基于 `std::mdspan` 视图实现，以 concept 限定读写能力，三个任务复用同一份乘法逻辑。循环顺序为 `i`→`t`→`j`，将 `A[i,t]` 提至最内层循环外以减少重复访问。
 
 ```cpp
 template <class View>
@@ -160,7 +142,91 @@ void gemm(MatrixReadable auto const& A, MatrixReadable auto const& B, MatrixWrit
 }
 ```
 
-`task3` 先用 `MPI_Dims_create` 将进程数分解为 `prow × pcol` 的二维网格，再把 A 按进程行切成若干行块，把 B 按进程列切成若干列块。根进程先把对应子块发送到各自的行根或列根，再通过行内广播和列内广播分发到整个进程网格，这样每个进程只负责一个 `C` 子块的计算。
+`task2` 使用的 `TaskHeader` 结构体将矩阵维度和进程数打包为一个整体，通过 `MPI_Type_create_struct` 构造派生类型后广播。
+
+```cpp
+struct TaskHeader {
+	int n = 0;
+	int k = 0;
+	int m = 0;
+	int procs = 0;
+};
+
+MpiDatatype make_header() {
+	return make_struct_datatype(
+		{ 1, 1, 1, 1 },
+		std::array<MPI_Aint, 4>{
+			offsetof(TaskHeader, n),
+			offsetof(TaskHeader, k),
+			offsetof(TaskHeader, m),
+			offsetof(TaskHeader, procs),
+		},
+		{ mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int>, mpi_type_v<int> });
+}
+```
+
+=== 任务一
+
+设进程数为 $p$，矩阵边长为 $d$，每个进程处理 $d/p$ 行，局部结果大小为 $(d/p) times d$。
+
+根进程读取输入后，通过 `MPI_Scatter` 将矩阵 $A$ 按行均分到各进程，再将完整的 $B$ 广播给所有进程。各进程在局部行块上调用乘法内核，最后用 `MPI_Gather` 回收结果。
+
+```cpp
+const int local_rows = dim / procs;
+vector<double> local_A(local_rows * dim);
+vector<double> local_C(local_rows * dim);
+
+world.scatter_equal(A, local_A);
+world.bcast(B);
+
+const auto A_view = make_matrix_view(local_A, local_rows, dim);
+const auto B_view = make_matrix_view(B, dim, dim);
+auto C_view = make_matrix_view(local_C, local_rows, dim);
+gemm(A_view, B_view, C_view);
+
+world.gather_equal(local_C, C);
+```
+
+=== 任务二
+
+任务二的通信模式与任务一的区别在于控制参数的传播方式：矩阵维度 $n,k,m$ 及进程数封装进上文已定义的 `TaskHeader`，通过 `MPI_Type_create_struct` 生成的派生类型一次性广播到所有进程。
+
+```cpp
+TaskHeader header{ options.dim, options.dim, options.dim, world.size() };
+const auto header_type = make_header();
+world.bcast_value(header, header_type.get());
+
+const int local_rows = header.n / header.procs;
+...
+world.scatter_equal(A, local_A);
+world.bcast(B);
+...
+gemm(A_view, B_view, C_view);
+world.gather_equal(local_C, C);
+```
+
+=== 任务三
+
+任务三将进程组织为二维网格。设总进程数为 $P$，通过 `MPI_Dims_create` 分解为 $P = p_r times p_c$，其中 `p_r` 为进程行数，`p_c` 为进程列数。矩阵 $A$（$m times n$）按行切分为 $p_r$ 块，矩阵 $B$（$n times k$）按列切分为 $p_c$ 块，进程 $(r,c)$ 负责计算子块 $C_{r,c} = A_r B_c$。
+
+设第 $r$ 个行块大小为 $m_r times n$，第 $c$ 个列块大小为 $n times k_c$，局部计算量为 $O(m_r n k_c)$。均衡划分下 $m_r ≈ m / p_r, k_c ≈ k / p_c$，每个进程计算量近似 $O((m n k) / P)$。
+
+```cpp
+std::array<int, 2> dims{ 0, 0 };
+mpi_check(MPI_Dims_create(procs, 2, dims.data()), "MPI_Dims_create");
+const int prow = dims[0];
+const int pcol = dims[1];
+
+const int row = world.rank() / pcol;
+const int col = world.rank() % pcol;
+
+MPI_Comm_split(MPI_COMM_WORLD, row, col, &row_comm);
+MPI_Comm_split(MPI_COMM_WORLD, col, row, &col_comm);
+```
+
+`MPI_Comm_split` 按行编号和列编号分别创建行通信域和列通信域，同一行的进程通过行内广播共享 $A$ 行块，同一列的进程通过列内广播共享 $B$ 列块。
+
+由于 `std::submdspan` 取出的子块不是连续存储，发送前用 `pack_view` 整理为连续缓冲区，接收后用 `unpack_view` 写回对应子块位置。
 
 ```cpp
 const auto row_counts = split_rows(dim, prow);
@@ -177,6 +243,8 @@ MPI_Comm_split(MPI_COMM_WORLD, col, row, &col_comm);
 auto A_block = slice_block(A_view, row_displs[r], row_counts[r], 0, dim);
 auto B_block = slice_block(B_view, 0, dim, col_displs[c], col_counts[c]);
 ```
+
+每个进程拿到局部子块后调用上文定义的 `gemm` 得到 $C_{r,c}$。根进程通过点对点通信逐块回收所有子块，按偏移写回全局 $C$ 矩阵，非根进程直接将局部结果发回根进程。
 
 = 实验结果
 
@@ -206,6 +274,8 @@ auto B_block = slice_block(B_view, 0, dim, col_displs[c], col_counts[c]);
   [16], [0.001196], [0.001831], [0.007437], [0.107725], [0.844656],
 )
 
+第一种实现为作为 baseline。128 矩阵规模下，单进程耗时 0.000362s，16 进程反而升至 0.001196s，通信与同步开销在问题规模过小时占主导。512 规模开始出现稳定加速：单进程 0.018575s 对 8 进程 0.005966s。2048 规模下加速效果最为显著，从单进程 2.248916s 降至 8 进程 0.836732s，16 进程 0.844656s 与 8 进程基本持平，说明 I/O 和同步瓶颈开始显现。
+
 第二种实现的结果如下。
 
 #table(
@@ -231,6 +301,8 @@ auto B_block = slice_block(B_view, 0, dim, col_displs[c], col_counts[c]);
   [8], [0.000455], [0.001873], [0.007136], [0.103104], [0.969275],
   [16], [0.000723], [0.001468], [0.007613], [0.112654], [0.902465],
 )
+
+第二种实现各规模、各进程数下与第一种相差均在毫秒量级以内——2048 规模 16 进程下第二种 0.902465s 对第一种 0.844656s，差值属正常测量抖动。说明将控制参数封装为派生类型广播不引入可观测的额外开销。
 
 第三种实现的结果如下。
 
@@ -258,8 +330,10 @@ auto B_block = slice_block(B_view, 0, dim, col_displs[c], col_counts[c]);
   [16], [0.001792], [0.001727], [0.008498], [0.044372], [0.812574],
 )
 
-三组数据放在一起看，整体趋势比较一致。矩阵越大，并行后节省的时间越明显；矩阵较小时，进程启动和通信的开销占比更高，所以不同做法之间差别不大。第二种实现把控制参数封成结构体后，整体时间与第一种仍然接近，说明参数封装带来的额外代价很小。第三种实现采用二维划分后，在较大规模下更容易获得稳定收益，尤其是在 1024 和 2048 规模、进程数较高时，结果明显优于前两种实现，这说明二维分块能够更好地平衡行与列方向的通信和计算压力。
+第三种实现的表现在不同规模下分化明显。128 和 256 规模下，pack/unpack 及额外的通信组织使耗时略高于前两种实现。1024 规模开始出现优势：4 进程 0.059984s 对第二种的 0.095631s，16 进程 0.044372s 对第二种的 0.112654s。2048 规模 16 进程下取得 0.812574s，为三种实现中最低。二维划分将通信压力分散到行广播和列广播两条独立路径，在大规模、高进程数场景下通信开销更低。
+
+整体来看，矩阵规模越小，进程启动和通信开销占比越高，不同实现之间差异不大。规模增大后，第一种和第二种在 1024、2048 规模下相比单进程有数倍加速，第三种在同样规模、高进程数下进一步优于前两者。二维网格划分在处理大规模矩阵时能更有效地平衡行与列方向的通信负载。
 
 = 实验感想
 
-这次实验把三种实现放在同一套共用代码下，代码结构更清楚，也更容易比较。最后看到的结果说明，矩阵规模足够大时，分配到多个进程后确实能把总时间压下来，但当规模较小时，通信和调度的影响还是很明显。整体来看，先把共用部分整理好，再去改通信方式，实验过程会更稳一些。
+二维划分写起来比一维麻烦不少，但性能提升不少。c++26 很好用，但是GCC 16 正式版什么时候发。
