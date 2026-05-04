@@ -1,4 +1,5 @@
 target("lab0.gen",function()
+	set_toolchains("gcc")
 	add_files("src/gen.cpp")
 end)
 

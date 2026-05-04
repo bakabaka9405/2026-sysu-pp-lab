@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-inline void mpi_check(int code, const char* call) {
+ void mpi_check(int code, const char* call) {
 	if (code == MPI_SUCCESS) {
 		return;
 	}
@@ -39,7 +39,7 @@ struct MpiType<double> {
 };
 
 template <typename T>
-inline constexpr MPI_Datatype mpi_type_v = MpiType<T>::value;
+ constexpr MPI_Datatype mpi_type_v = MpiType<T>::value;
 
 class MPIEnvironment final {
 public:
