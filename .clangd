@@ -163,10 +163,13 @@ Diagnostics:
 
 CompileFlags:
   Add: [-xc++, -Wall, -Wextra, -Wno-unused-variable, -std=c++26, -DMR_CLANGD]
-  Compiler: 'C:\\Tools\\mingw64\\bin\\g++.exe'
+  Compiler: 'g++.exe'
 
 InlayHints:
   Enabled: true
   ParameterNames: true
   DeducedTypes: true
   Designators: false
+
+Documentation:
+  CommentFormat: Doxygen

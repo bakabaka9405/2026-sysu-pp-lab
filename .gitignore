@@ -6,7 +6,6 @@ build/
 .DS_Store
 
 *.asm
-mirai_config.json
 .vscode/
 data/
 AGENTS.md
