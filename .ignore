@@ -7,8 +7,3 @@ build/
 
 *.asm
 .vscode/
-data/
-AGENTS.md
-*.pdf
-*.ps1
-tinymist.lock

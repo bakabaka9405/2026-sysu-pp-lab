@@ -52,8 +52,8 @@
 == 实验平台配置
 
 - 操作系统：Windows 11 23H2 22631.6199
-- 处理器：13th Gen Intel(R) Core(TM) i5-13600K
-- Microsoft MPI 版本：10.1.12498.18
+- 处理器：13th Gen Intel(R) Core(TM) i5-13600K 12 核 20 线程
+- GCC 版本：gcc version 16.1.0 (Rev1, Built by MSYS2 project)
 
 
 
